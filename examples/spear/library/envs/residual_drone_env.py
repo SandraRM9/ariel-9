@@ -7,11 +7,17 @@ The PPO actor in Stage 3 only ever sees / produces ``residual``. The prior
 is owned by the env, so PPO is unchanged from 27_v4 except for obs-space
 dimensions:
 
-  obs = (gate_drone_obs, task_one_hot[5], morph_features[22])
+  obs = (gate_drone_obs, task_one_hot[5], morph_features[22],
+         cmaes_params[11], median_score[1])
 
-For Stage 2 we ship a single-morph variant (hover task only). Stage 3's
-MultiTaskHexVecEnv aggregator will rotate morphs across workers and add
-the other four tasks; the per-worker prior+residual logic lives here.
+The trailing ``cmaes_params + median_score`` block (PRIOR_TAIL_DIM) is
+**critic-only**: the actor must never condition on it, or it can learn
+to selectively undo the prior. The policy's ``_split`` in
+``37_train_residual_mtrl.py`` routes it to the critic input exclusively.
+
+All five tasks are wired (``_task_gate_config``); each env instance holds
+one (morph, task) pair for its lifetime. ``37``'s MorphRotatingVecEnv
+rotates (morph, task) pairs across workers.
 
 Plan gate (per IMPLEMENTATION_PLAN.md step 6):
     With α=0 and any residual, env behaves identically to the prior
@@ -38,11 +44,21 @@ from prior_controller import HoverPrior  # noqa: E402
 TASK_NAMES = ("hover", "figure8", "slalom", "shuttle-run", "circle")
 NUM_TASKS = len(TASK_NAMES)
 MORPH_FEAT_DIM = 22
+# Critic-only tail: as-trained cmaes_params (N+5 = 11 for hex) plus the
+# library's median CMA score — "how trustworthy is my prior on this morph."
+PRIOR_PARAM_DIM = 11
+PRIOR_TAIL_DIM = PRIOR_PARAM_DIM + 1
 
 # Per-task env shaping, mirroring 27_v4 (so trajectory tasks see the same
 # reward landscape as the non-residual baseline; only the action plumbing
 # changes).
-UPRIGHT_BONUS = 0.01
+# v5 reward rebalance: at the old values (upright 0.01, velocity 0.005)
+# the unconditional upright bonus paid ~+10 per 1000 steps while velocity-
+# toward-gate paid about the same at near-hover speeds — "level drifting"
+# earned nearly as much dense reward as gate-seeking (observed: figure8
+# +20 total with 0 gates passed). Upright is cut to a token stabiliser and
+# velocity raised 6× so the dominant dense term points at the active gate.
+UPRIGHT_BONUS = 0.002
 # Tilt-termination disabled (0.0). At the previous 0.10 (≈85°) threshold,
 # random-residual diagnostics showed ~97.5% of all episode terminations
 # across every task were tilt-induced — the threshold was the binding
@@ -50,7 +66,7 @@ UPRIGHT_BONUS = 0.01
 # NaN-divergence + altitude floor + OOB bounds remain as kill conditions.
 TILT_TERMINATE_COS = 0.0
 EXTRA_YAW_RATE_PEN = 0.005
-VELOCITY_REWARD_COEF = 0.005
+VELOCITY_REWARD_COEF = 0.03
 ALTITUDE_FLOOR_Z = -0.5
 ALTITUDE_FLOOR_COEF = 0.5
 
@@ -88,10 +104,13 @@ class ResidualDroneEnv(TorchDroneGateEnv):
     morph
         Dict with keys ``propellers``, ``mass``, ``inertia``, ``prop_size``,
         ``cmaes_params`` (N+5 numpy array), ``morph_features`` (22d numpy
-        array). Typically one row of ``__data__/hex_library/v1/library.npz``.
+        array), and optionally ``median_score`` (scalar, critic-only prior
+        trustworthiness signal; defaults to 0.0 if absent). Typically one
+        row of ``__data__/hex_library/v1/library.npz``.
     task
-        One of ``TASK_NAMES``. For Stage 2 only ``"hover"`` is implemented;
-        the other tasks raise until Stage 3 adds their gate configs.
+        One of ``TASK_NAMES``. All five tasks are wired via
+        ``_task_gate_config``; hover uses a single stationary gate at the
+        hover target, the rest pull from ``GATE_CONFIGS``.
     alpha
         Residual scaling. Default 0.4 matches plan v2.
     num_envs
@@ -228,29 +247,54 @@ class ResidualDroneEnv(TorchDroneGateEnv):
         # ---- expand observation space ----------------------------------
         base_dim = self.observation_space.shape[0]
         self._base_obs_dim = base_dim
-        self._full_obs_dim = base_dim + NUM_TASKS + MORPH_FEAT_DIM
+        self._full_obs_dim = (
+            base_dim + NUM_TASKS + MORPH_FEAT_DIM + PRIOR_TAIL_DIM
+        )
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(self._full_obs_dim,), dtype=np.float32,
         )
-        # task_one_hot and morph_features are static per env
+        # Static per env: task_one_hot + morph_features (actor + critic),
+        # then as-trained cmaes_params + median_score (critic-only — the
+        # policy's _split must not feed these to the actor).
+        if self._cmaes_params_np.shape[0] != PRIOR_PARAM_DIM:
+            raise ValueError(
+                f"cmaes_params must be {PRIOR_PARAM_DIM}d, got "
+                f"{self._cmaes_params_np.shape[0]}d"
+            )
         self._task_oh = np.zeros(NUM_TASKS, dtype=np.float32)
         self._task_oh[self.task_id] = 1.0
-        self._tail = np.concatenate(
-            [self._task_oh, self._morph_features_np]
-        ).astype(np.float32)
+        median_score = float(morph.get("median_score", 0.0))
+        self._tail = np.concatenate([
+            self._task_oh,
+            self._morph_features_np,
+            self._cmaes_params_np,
+            np.array([median_score / 100.0], dtype=np.float32),
+        ]).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Action: residual → residual + prior, all on device
     # ------------------------------------------------------------------
 
     def step_async(self, residual_actions: np.ndarray) -> None:
-        """Compose total action = effort_to_action(prior_effort + α·residual)."""
+        """Compose total action = effort_to_action(prior_effort + α·residual).
+
+        Hover uses the pure altitude/attitude hover prior. Trajectory tasks use
+        trajectory_effort, which adds a proportional outer position loop that
+        generates roll/pitch setpoints toward the active gate so the prior
+        provides lateral guidance rather than just level-hovering.
+        """
         residual = torch.as_tensor(
             residual_actions, device=self.dev, dtype=self.dtype,
         )
-        # prior_effort matches the parent's world_states layout (12+N)
-        effort = self.prior.prior_effort(self.world_states, self._cmaes_params_t)
+        if self.task_name == "hover":
+            effort = self.prior.prior_effort(self.world_states, self._cmaes_params_t)
+        else:
+            tg = self.target_gates % self.num_gates
+            gate_xy_err = self.world_states[:, :2] - self.gate_pos_t[tg, :2]  # (B, 2)
+            effort = self.prior.trajectory_effort(
+                self.world_states, self._cmaes_params_t, gate_xy_err,
+            )
         total_action = self.prior.effort_to_action(effort + self.alpha * residual)
         # parent's step_async stores actions_t; we bypass it and write directly
         self.prev_actions_t = self.actions_t.clone()
@@ -277,6 +321,19 @@ class ResidualDroneEnv(TorchDroneGateEnv):
         self._update_obs()
         base = self._obs_t.cpu().numpy()
         return self._expand_obs(base)
+
+    def _reset_envs(self, mask: torch.Tensor) -> None:
+        """Override parent reset to fix motor state after per-episode resets.
+
+        TorchDroneGateEnv._reset_envs initialises motors to random values in
+        [-1, 1] when initialize_at_random_gates=True (slalom/shuttle-run/circle).
+        The hover prior expects near-hover motor state; random init causes an
+        immediate thrust spike that diverges the simulation before the prior can
+        correct. Override sets all motors to w_hover_norm after every reset.
+        """
+        super()._reset_envs(mask)
+        if mask.any():
+            self.world_states[mask, 12:12 + self.num_motors] = self._w_hover_norm
 
     def step_wait(self):
         base_obs, rewards, dones, infos = super().step_wait()

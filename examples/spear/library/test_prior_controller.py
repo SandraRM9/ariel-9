@@ -111,13 +111,19 @@ def test_prior_param_dim_is_n_plus_5(hex_setup):
 
 
 def test_default_init_params_matches_35c_warmstart(hex_setup):
-    """Without morph args, the warm-start matches the original 35c
-    hand-tuned values (back-compat)."""
+    """Without morph args, the gain warm-start matches the original 35c
+    hand-tuned values (back-compat). Trims are the analytical
+    hover-balance solution, not zeros — they null the static roll/pitch
+    moment of asymmetric morphs so high-TWR hexes don't flip before CMA
+    refines the gains."""
     _, _, prior = hex_setup
     init = prior.default_init_params()
     N = prior.n_motors
     assert init.shape == (prior.param_dim,)
-    np.testing.assert_array_equal(init[:N], np.zeros(N, dtype=np.float32))
+    np.testing.assert_allclose(
+        init[:N], prior._analytical_trim().astype(np.float32), atol=1e-6,
+    )
+    assert np.all(np.abs(init[:N]) <= 1.0)
     assert init[N + 0] == pytest.approx(+0.5)     # k_alt_p
     assert init[N + 1] == pytest.approx(-0.5)     # k_alt_d
     assert init[N + 2] == pytest.approx(+0.3)     # k_tilt
@@ -183,14 +189,16 @@ def test_prior_action_in_action_range(hex_setup):
 
 def test_at_hover_target_effort_is_zero_except_yaw(hex_setup):
     """State exactly at hover with zero rates and zero attitude → all
-    feedback terms are zero. Effort vector equals trim (=zeros by default).
-    """
+    feedback terms are zero. Effort vector equals the trim component of
+    the params (analytical hover-balance trims by default)."""
     _, _, prior = hex_setup
     state = torch.zeros(12 + prior.n_motors)
     state[2] = prior.target[2]            # at altitude
     params = torch.tensor(prior.default_init_params())
     eff = prior.prior_effort(state, params)
-    np.testing.assert_allclose(eff.numpy(), np.zeros(prior.n_motors), atol=1e-6)
+    np.testing.assert_allclose(
+        eff.numpy(), params[: prior.n_motors].numpy(), atol=1e-6,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -233,8 +241,11 @@ def test_pitch_disturbance_commands_less_thrust_at_front(hex_setup):
     regresses to its original `+cos(phi)`."""
     morph, _, prior = hex_setup
     params = torch.tensor(prior.default_init_params())
+    # Delta relative to the undisturbed hover action isolates the mixer
+    # response from the (non-zero) analytical hover-balance trims.
+    base = prior.prior_action(_state_with_disturbance(prior), params)
     state = _state_with_disturbance(prior, pitch=+0.05)
-    action = prior.prior_action(state, params)              # (N,)
+    delta = prior.prior_action(state, params) - base        # (N,)
 
     locs = np.array([p["loc"] for p in morph.propellers], dtype=np.float32)
     front_mask = locs[:, 0] > 0.01      # +x side
@@ -242,11 +253,11 @@ def test_pitch_disturbance_commands_less_thrust_at_front(hex_setup):
     assert front_mask.any() and rear_mask.any(), (
         "morph has no clear front/rear motor split — pick a different fixture"
     )
-    front_thrust = action[front_mask].mean().item()
-    rear_thrust  = action[rear_mask].mean().item()
+    front_thrust = delta[front_mask].mean().item()
+    rear_thrust  = delta[rear_mask].mean().item()
     assert front_thrust < rear_thrust, (
         f"nose-up disturbance should command less thrust at front "
-        f"({front_thrust:+.4f}) than at rear ({rear_thrust:+.4f}). "
+        f"(Δ{front_thrust:+.4f}) than at rear (Δ{rear_thrust:+.4f}). "
         f"Mixer sign bug suspected."
     )
 
@@ -257,18 +268,20 @@ def test_roll_disturbance_commands_more_thrust_on_low_side(hex_setup):
     as pitch test; this one defends the roll mixer column."""
     morph, _, prior = hex_setup
     params = torch.tensor(prior.default_init_params())
+    # Delta vs. undisturbed hover — see pitch test for rationale.
+    base = prior.prior_action(_state_with_disturbance(prior), params)
     state = _state_with_disturbance(prior, roll=+0.05)
-    action = prior.prior_action(state, params)
+    delta = prior.prior_action(state, params) - base
 
     locs = np.array([p["loc"] for p in morph.propellers], dtype=np.float32)
     right_mask = locs[:, 1] > 0.01      # +y side
     left_mask  = locs[:, 1] < -0.01     # -y side
     assert right_mask.any() and left_mask.any()
-    right_thrust = action[right_mask].mean().item()
-    left_thrust  = action[left_mask].mean().item()
+    right_thrust = delta[right_mask].mean().item()
+    left_thrust  = delta[left_mask].mean().item()
     assert right_thrust > left_thrust, (
         f"right-wing-down disturbance should command more thrust on the "
-        f"right ({right_thrust:+.4f}) than the left ({left_thrust:+.4f})"
+        f"right (Δ{right_thrust:+.4f}) than the left (Δ{left_thrust:+.4f})"
     )
 
 

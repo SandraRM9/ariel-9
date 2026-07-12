@@ -269,8 +269,9 @@ class HoverPrior:
     ) -> np.ndarray:
         """Warm-started parameter vector matching 35c.
 
-        Trims zeroed; gains hand-picked with the correct *signs* so CMA
-        starts on the right side of zero.
+        Trims set to the analytical hover-balance solution (see
+        ``_analytical_trim``); gains hand-picked with the correct *signs*
+        so CMA starts on the right side of zero.
 
         If `mass` and `inertia` are supplied, the gains are **scaled by
         the morph's mass / inertia** to keep the closed-loop bandwidth
@@ -416,6 +417,64 @@ class HoverPrior:
         yaw_cmd  = k_yaw_rate * self.yaw_mix.unsqueeze(0) * yaw_rate                    # (B, N)
 
         effort = trim + alt_cmd + att_cmd + rate_cmd + yaw_cmd                          # (B, N)
+        return effort if batched else effort.squeeze(0)
+
+    @torch.no_grad()
+    def trajectory_effort(
+        self,
+        state: torch.Tensor,
+        params: torch.Tensor,
+        gate_xy_err: torch.Tensor,
+        *,
+        k_pos: float = 0.15,
+        max_tilt: float = 0.5,
+    ) -> torch.Tensor:
+        """prior_effort extended with a proportional outer position loop.
+
+        Converts the xy error from drone to active gate into desired roll/pitch
+        setpoints so the prior actively seeks the gate rather than just leveling.
+        Used by ResidualDroneEnv for all non-hover trajectory tasks.
+
+        Sign convention (NED, ZYX Euler, z↓ positive):
+          gate_xy_err[:, 0] = drone_x − gate_x  (+ = drone north of gate → theta_des > 0, tilts south)
+          gate_xy_err[:, 1] = drone_y − gate_y  (+ = drone east  of gate → phi_des   < 0, tilts west)
+
+        Parameters
+        ----------
+        state       : (B, 12+N) or (12+N,)
+        params      : (B, N+5) or (N+5,) — scaled cmaes_params (TASK_PRIOR_GAIN_SCALE applied)
+        gate_xy_err : (B, 2) or (2,)  — world-frame (x, y) offset, drone minus gate position
+        k_pos       : P-gain (rad/m) mapping position error to desired tilt
+        max_tilt    : magnitude clamp on desired roll/pitch (rad), default ≈28°
+        """
+        batched = state.dim() == 2
+        if not batched:
+            state       = state.unsqueeze(0)
+            params      = params.unsqueeze(0) if params.dim() == 1 else params
+            gate_xy_err = gate_xy_err.unsqueeze(0)
+
+        z_err      = state[:, 2:3] - self.target[2]
+        vz         = state[:, 5:6]
+        roll       = state[:, 6:7]
+        pitch      = state[:, 7:8]
+        roll_rate  = state[:, 9:10]
+        pitch_rate = state[:, 10:11]
+        yaw_rate   = state[:, 11:12]
+
+        trim, k_alt_p, k_alt_d, k_tilt, k_rate, k_yaw_rate = self._split_params(params)
+
+        # Outer position loop: error → desired attitude setpoints
+        theta_des = ( k_pos * gate_xy_err[:, 0:1]).clamp(-max_tilt, max_tilt)  # (B, 1)
+        phi_des   = (-k_pos * gate_xy_err[:, 1:2]).clamp(-max_tilt, max_tilt)  # (B, 1)
+
+        alt_cmd  = k_alt_p * z_err - k_alt_d * vz
+        att_cmd  = k_tilt * (self.mix[:, 0].unsqueeze(0) * (pitch - theta_des)
+                             + self.mix[:, 1].unsqueeze(0) * (roll  - phi_des))
+        rate_cmd = k_rate * (self.mix[:, 0].unsqueeze(0) * pitch_rate
+                             + self.mix[:, 1].unsqueeze(0) * roll_rate)
+        yaw_cmd  = k_yaw_rate * self.yaw_mix.unsqueeze(0) * yaw_rate
+
+        effort = trim + alt_cmd + att_cmd + rate_cmd + yaw_cmd
         return effort if batched else effort.squeeze(0)
 
     def effort_to_action(self, effort: torch.Tensor) -> torch.Tensor:

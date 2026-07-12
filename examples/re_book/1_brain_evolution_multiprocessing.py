@@ -97,7 +97,7 @@ def _init_worker(base_seed: int) -> None:
 # ]
 
 TARGET_POSITIONS = [
-    [0.5, -2, 0.1]  # Right
+    [0.0, -2, 0.1]  # Right
 ]
 
 # Global constants
@@ -548,8 +548,8 @@ if __name__ == "__main__":
     end = time.time()
 
     console.log(f"Evolution took {(end-start)/60:.2f} minutes")
-
-    weights_path = DATA / "best_weights.npy"
+    date_now = time.strftime("%Y%m%d_%H%M%S")
+    weights_path = DATA / f"{date_now}_best_weights.npy"
     np.save(weights_path, best_weights)
     console.log(f"[green]Best weights saved to {weights_path}[/green]")
 
@@ -609,60 +609,86 @@ if __name__ == "__main__":
 
         return network.forward(m, d, state)
 
-# --- REPLAY BEST & RECORD VIDEO ---
-    console.log("[cyan]Rendering Best Video...[/cyan]")
+# --- REPLAY BEST & RECORD VIDEO (top-down follow cam + trajectory overlay) ---
+    console.log("[cyan]Rendering Best Video (top-down follow)...[/cyan]")
 
-    # Setup VideoRecorder
     video_recorder = VideoRecorder(
-        file_name="spider_vision_best",
+        file_name="spider_topdown_best",
         output_folder=path_to_video_folder
     )
 
-    # Setup Visualization Options
     viz_options = mujoco.MjvOption()
     viz_options.flags[mujoco.mjtVisFlag.mjVIS_JOINT] = False
     viz_options.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
     viz_options.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR] = False
     viz_options.flags[mujoco.mjtVisFlag.mjVIS_BODYBVH] = False
 
-    # Get Camera ID ("video_cam")
-    try:
-        camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "video_cam")
-    except Exception:
-        camera_id = -1 # Fallback to default free camera if not found
+    # Top-down free camera that follows the robot.
+    top_cam = mujoco.MjvCamera()
+    top_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    top_cam.lookat = np.array([0.0, 0.0, 0.0])
+    top_cam.distance = 4.0       # height above robot (metres)
+    top_cam.azimuth = 90.0
+    top_cam.elevation = -90.0
 
-    # Timing Variables
+    # Timing
     fps = 30
     dt = model.opt.timestep
-    # Prevent infinite loops when dt is large enough that 1/(fps*dt) < 1.
     steps_per_frame = max(1, int(round(1.0 / (fps * dt))))
     control_step_freq = 50
     current_ctrl = np.zeros(model.nu)
     render_step = 0
 
-    # Main Rendering Loop (Using Context Manager for safe memory handling)
-    with mujoco.Renderer(model, height=480, width=640) as renderer:
+    trajectory_xy: list[np.ndarray] = []
+    target_xy = np.asarray(TARGET_POSITIONS[0][:2], dtype=np.float32)
 
+    video_H, video_W = 480, 640
+    fovy_rad = np.deg2rad(float(model.vis.global_.fovy))
+    px_per_m = video_H / (2.0 * top_cam.distance * np.tan(fovy_rad / 2.0))
+
+    def _world_to_px(wx: float, wy: float, cx: float, cy: float) -> tuple[int, int]:
+        u = int(round(video_W / 2 + (wx - cx) * px_per_m))
+        v = int(round(video_H / 2 - (wy - cy) * px_per_m))
+        return u, v
+
+    with mujoco.Renderer(model, height=video_H, width=video_W) as renderer:
         while data.time < DURATION:
-            # INNER LOOP: Step physics N times to match Video FPS
             for _ in range(steps_per_frame):
                 if render_step % control_step_freq == 0:
                     current_ctrl = get_vision_control_signal(model, data)
-
-                # Safely copy control array
                 np.copyto(data.ctrl, current_ctrl)
                 mujoco.mj_step(model, data)
                 render_step += 1
 
-            # OUTER LOOP: Render Frame (Once per 1/30th second)
-            renderer.update_scene(
-                data,
-                scene_option=viz_options,
-                camera=camera_id
-            )
-            video_recorder.write(frame=renderer.render())
+            robot_xy = np.array(data.qpos[0:2], dtype=np.float32)
+            trajectory_xy.append(robot_xy.copy())
 
-        # Finish Video
+            top_cam.lookat[0] = float(robot_xy[0])
+            top_cam.lookat[1] = float(robot_xy[1])
+            top_cam.lookat[2] = 0.0
+
+            renderer.update_scene(data, scene_option=viz_options, camera=top_cam)
+            frame = renderer.render().copy()
+
+            cx, cy = float(robot_xy[0]), float(robot_xy[1])
+
+            # Trajectory polyline (yellow in RGB).
+            if len(trajectory_xy) >= 2:
+                pts = np.array(
+                    [_world_to_px(p[0], p[1], cx, cy) for p in trajectory_xy],
+                    dtype=np.int32,
+                )
+                cv2.polylines(frame, [pts], False, (255, 255, 0), 2)
+
+            # Start marker (red) and target marker (green ring).
+            sx, sy = _world_to_px(trajectory_xy[0][0], trajectory_xy[0][1], cx, cy)
+            cv2.circle(frame, (sx, sy), 6, (255, 0, 0), -1)
+
+            tu, tv = _world_to_px(target_xy[0], target_xy[1], cx, cy)
+            cv2.circle(frame, (tu, tv), 10, (0, 255, 0), 2)
+
+            video_recorder.write(frame=frame)
+
         video_recorder.release()
         console.log(f"[green]Video rendering complete. Saved to {path_to_video_folder}[/green]")
 

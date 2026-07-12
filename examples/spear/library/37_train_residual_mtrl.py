@@ -1,22 +1,20 @@
-"""Stage 3 MVP — PPO residual on top of the analytical hover prior, with
-per-worker morphology rotation.
+"""Stage 3 — multi-task PPO residual on top of the analytical hover prior,
+with per-worker (morph, task) rotation.
 
-Each VecEnv worker holds a different morph from `__data__/hex_library/v1`
-and runs the hover task. Observations are
-``(gate_obs[26], task_one_hot[5], morph_features[22]) = 53d``. Actions
-are residual in ``[-1, 1]^N``; the env adds ``α · residual`` to the
-analytical prior internally.
+Each VecEnv worker holds one (morph, task) pair for the whole run: morphs
+come from `__data__/hex_library/v1` (minus a stratified held-out split),
+tasks are assigned round-robin across all 5 (hover, figure8, slalom,
+shuttle-run, circle). Observations are
+``(gate_obs[26], task_one_hot[5], morph_features[22],
+   cmaes_params[11], median_score[1]) = 65d``
+where the trailing 12d prior descriptor is **critic-only** (the actor
+never sees it — see `_split`). Actions are residual in ``[-1, 1]^N``; the
+env adds ``α_task · residual`` to the analytical prior internally.
 
-This is the architectural MVP for the v2 plan. Two limits vs the full
-Stage 3 design (intentionally deferred):
-
-  * Only the hover task is wired into `ResidualDroneEnv` so far. The
-    other four tasks (figure8, slalom, shuttle-run, circle) will come
-    with their `GATE_CONFIGS` entries plus per-task reward shaping.
-  * Each worker holds ONE morph for the entire run. True per-episode
-    morph rotation needs a refactor of `ResidualDroneEnv` to swap
-    `cmaes_params` + `morph_features` on `reset`; for now we get
-    diversity from N different workers.
+One remaining limit vs the full Stage 3 design (intentionally deferred):
+each worker holds ONE morph for the entire run. True per-episode morph
+rotation needs a refactor of `ResidualDroneEnv` to swap `cmaes_params` +
+`morph_features` on `reset`; for now diversity comes from N workers.
 
 Gate (IMPLEMENTATION_PLAN.md step 7):
   * Step-0 mean reward should be high — the prior alone hovers.
@@ -24,12 +22,17 @@ Gate (IMPLEMENTATION_PLAN.md step 7):
 
 Run:
     uv run examples/spear/library/37_train_residual_mtrl.py \\
-        --steps 1_000_000 --num-envs 20
+        --steps 20_000_000 --num-envs 20
+
+Resume from checkpoint:
+    uv run examples/spear/library/37_train_residual_mtrl.py \\
+        --resume __data__/library_residual_mtrl/<timestamp> --out-dir <new_dir>
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -45,21 +48,25 @@ from stable_baselines3.common.vec_env import VecEnv, VecNormalize
 
 sys.path.insert(0, str(Path(__file__).parent))
 from envs.residual_drone_env import (  # noqa: E402
-    MORPH_FEAT_DIM, NUM_TASKS, ResidualDroneEnv, TASK_NAMES,
+    MORPH_FEAT_DIM, NUM_TASKS, PRIOR_TAIL_DIM, ResidualDroneEnv, TASK_NAMES,
 )
-from hex_sampler import sample_feasible  # noqa: E402
+from hex_sampler import _stratify_key, sample_feasible  # noqa: E402
 
 # Obs layout (must match ResidualDroneEnv expansion):
 #   base = TorchDroneGateEnv.state_len   (gate_obs + drone + motor_w)
 #   tail = task_oh (5) + morph_features (22)
+#          + cmaes_params (11) + median_score (1)   ← critic-only
 # state_len for hex (6 motors, 1 hover gate, 2 gates_ahead) = 12+6+4*2 = 26
 DRONE_OBS_DIM = 18                                # state + motor_w (shared)
 TASK_OBS_DIM = 8                                  # 2 gates × (xyz + yaw)
 BASE_OBS_DIM = DRONE_OBS_DIM + TASK_OBS_DIM       # 26 — matches parent
-TAIL_DIM = NUM_TASKS + MORPH_FEAT_DIM             # 27
-FULL_OBS_DIM = BASE_OBS_DIM + TAIL_DIM            # 53
+TAIL_DIM = NUM_TASKS + MORPH_FEAT_DIM + PRIOR_TAIL_DIM  # 39
+FULL_OBS_DIM = BASE_OBS_DIM + TAIL_DIM            # 65
 SHARED_IN_DIM = DRONE_OBS_DIM + MORPH_FEAT_DIM    # 40 — drone+morph to shared
-CRITIC_IN_DIM = BASE_OBS_DIM + MORPH_FEAT_DIM     # 48 — per-task critic input
+# Per-task critic additionally sees the 12d prior descriptor
+# (cmaes_params + median_score) — "how trustworthy is my prior here."
+# The actor path never touches it, so it cannot learn to undo the prior.
+CRITIC_IN_DIM = BASE_OBS_DIM + MORPH_FEAT_DIM + PRIOR_TAIL_DIM  # 60
 
 ENCODER_LATENT = 32
 ENCODER_HIDDEN = 128
@@ -86,6 +93,7 @@ def _load_morph_library(path: Path, n_morphs: int) -> list[dict]:
             continue
         m = by_seed[seed]
         morphs.append({
+            "morph_seed":     seed,
             "propellers":     m.propellers,
             "mass":           float(m.mass),
             "inertia":        m.inertia,
@@ -93,6 +101,8 @@ def _load_morph_library(path: Path, n_morphs: int) -> list[dict]:
             "twr":            float(m.twr),
             "cmaes_params":   d["cmaes_params"][i].astype(np.float32),
             "morph_features": d["morph_features"][i].astype(np.float32),
+            "median_score":   float(d["median_score"][i]),
+            "cell":           _stratify_key(m),
         })
     if not morphs:
         raise RuntimeError(
@@ -100,6 +110,37 @@ def _load_morph_library(path: Path, n_morphs: int) -> list[dict]:
             f"({len(seeds_in_lib)} in library)"
         )
     return morphs
+
+
+def _select_held_out(morphs: list[dict], n_held_out: int, seed: int) -> list[int]:
+    """Pick `n_held_out` morph indices stratified across the sampler's
+    27 (arm, prop, asym) cells: shuffle the occupied cells, then take one
+    morph per cell round-robin so the held-out set spans the coverage
+    grid rather than clustering. Deterministic in `seed`."""
+    if n_held_out <= 0:
+        return []
+    if n_held_out >= len(morphs):
+        raise ValueError(
+            f"held-out size {n_held_out} >= library size {len(morphs)}"
+        )
+    rng = np.random.RandomState(seed)
+    by_cell: dict[tuple, list[int]] = {}
+    for i, m in enumerate(morphs):
+        by_cell.setdefault(m["cell"], []).append(i)
+    cells = sorted(by_cell)
+    rng.shuffle(cells)
+    for idxs in by_cell.values():
+        rng.shuffle(idxs)
+    held: list[int] = []
+    while len(held) < n_held_out:
+        progressed = False
+        for c in cells:
+            if by_cell[c] and len(held) < n_held_out:
+                held.append(by_cell[c].pop())
+                progressed = True
+        if not progressed:
+            break
+    return sorted(held)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,8 +197,9 @@ class _PerTaskRewardNormalizer:
 class MorphRotatingVecEnv(VecEnv):
     """One `ResidualDroneEnv` per slot. Slots are assigned a (morph, task)
     pair so every task gets at least one worker and morphs rotate across
-    tasks. Observations are the expanded 53d vector; the residual action
-    space matches the per-env motor count (hex = 6).
+    tasks. Observations are the expanded 65d vector (incl. the critic-only
+    prior descriptor); the residual action space matches the per-env motor
+    count (hex = 6).
     """
 
     def __init__(self, morphs: list[dict], tasks: list[str] | str = "hover",
@@ -210,6 +252,7 @@ class MorphRotatingVecEnv(VecEnv):
             obs_list.append(o[0]); r_list.append(float(r[0])); d_list.append(bool(d[0]))
             info[0]["task"] = self.slot_tasks[i]
             info[0]["task_id"] = int(self.task_ids[i])
+            info[0]["mean_abs_residual"] = float(np.abs(self._actions_buffer[i]).mean())
             infos.append(info[0])
         raw_rewards = np.asarray(r_list, dtype=np.float32)
         dones_np = np.asarray(d_list, dtype=bool)
@@ -306,12 +349,20 @@ class MTRLActorCriticPolicy(ActorCriticPolicy):
         )
 
     def _split(self, obs):
-        """Split 53d obs → (drone, task_obs, one_hot, morph, base+morph)."""
+        """Split 65d obs → (drone, task_obs, one_hot, morph, critic_in).
+
+        The trailing 12d prior descriptor (cmaes_params + median_score) is
+        routed to `critic_in` ONLY — the actor paths (drone, task_obs,
+        morph) must never include it."""
+        morph_end = BASE_OBS_DIM + self.num_tasks + MORPH_FEAT_DIM    # 53
         drone = obs[:, :DRONE_OBS_DIM]                                # 18
         task_obs = obs[:, DRONE_OBS_DIM:BASE_OBS_DIM]                 # 8
         one_hot = obs[:, BASE_OBS_DIM:BASE_OBS_DIM + self.num_tasks]  # 5
-        morph = obs[:, BASE_OBS_DIM + self.num_tasks:]                # 22
-        critic_in = torch.cat([obs[:, :BASE_OBS_DIM], morph], dim=1)  # 48
+        morph = obs[:, BASE_OBS_DIM + self.num_tasks:morph_end]       # 22
+        prior_desc = obs[:, morph_end:]                               # 12
+        critic_in = torch.cat(
+            [obs[:, :BASE_OBS_DIM], morph, prior_desc], dim=1,
+        )                                                             # 60
         return drone, task_obs, one_hot, morph, critic_in
 
     def _actor_latent(self, drone, task_obs, one_hot, morph):
@@ -378,12 +429,114 @@ class EntCoefAnneal(BaseCallback):
         return True
 
 
+class GradientCosineCallback(BaseCallback):
+    """Log pairwise per-task actor gradient cosine similarities.
+
+    Fires at `_on_rollout_end` (after rollout collection, before PPO's train())
+    when the rollout buffer is still shaped (buffer_size, n_envs, ...).
+
+    PCGrad escalation trigger (not enacted here, logging only):
+      cosine < 0 in >50% of logged updates AFTER 20M steps.
+    """
+
+    def __init__(self, raw_env: "MorphRotatingVecEnv", log_every: int = 250_000):
+        super().__init__(verbose=0)
+        self.raw_env = raw_env
+        self.log_every = log_every
+        self._next_log = log_every
+
+    def _on_rollout_end(self) -> bool:
+        if self.num_timesteps < self._next_log:
+            return True
+        self._next_log += self.log_every
+
+        rb = self.model.rollout_buffer
+        if not rb.full:
+            return True
+
+        policy = self.model.policy
+        clip_range = float(self.model.clip_range(self.model._current_progress_remaining))
+        actor_params = (
+            list(policy.shared_encoder.parameters())
+            + list(policy.task_encoders.parameters())
+            + list(policy.actor_trunk.parameters())
+            + list(policy.action_mean.parameters())
+        )
+
+        prev_training = policy.training
+        policy.set_training_mode(True)
+        policy.optimizer.zero_grad()
+
+        task_grads: dict[str, torch.Tensor] = {}
+        for task in TASK_NAMES:
+            env_indices = [
+                i for i, t in enumerate(self.raw_env.slot_tasks) if t == task
+            ]
+            if not env_indices:
+                continue
+
+            # rb arrays are (buffer_size, n_envs, ...) before get() flattens them
+            obs_t = torch.as_tensor(
+                rb.observations[:, env_indices].reshape(-1, rb.observations.shape[-1]),
+                device=self.model.device, dtype=torch.float32,
+            )
+            acts_t = torch.as_tensor(
+                rb.actions[:, env_indices].reshape(-1, rb.actions.shape[-1]),
+                device=self.model.device, dtype=torch.float32,
+            )
+            logp_old = torch.as_tensor(
+                rb.log_probs[:, env_indices].reshape(-1),
+                device=self.model.device, dtype=torch.float32,
+            )
+            adv = torch.as_tensor(
+                rb.advantages[:, env_indices].reshape(-1),
+                device=self.model.device, dtype=torch.float32,
+            )
+            adv_norm = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+            policy.optimizer.zero_grad()
+            _values, log_prob, _entropy = policy.evaluate_actions(obs_t, acts_t)
+            ratio = torch.exp(log_prob - logp_old)
+            loss = -torch.min(
+                ratio * adv_norm,
+                ratio.clamp(1.0 - clip_range, 1.0 + clip_range) * adv_norm,
+            ).mean()
+            loss.backward()
+
+            grads = [p.grad.flatten() for p in actor_params if p.grad is not None]
+            if grads:
+                task_grads[task] = torch.cat(grads).detach().clone()
+
+        policy.optimizer.zero_grad()
+        policy.set_training_mode(prev_training)
+
+        if len(task_grads) < 2:
+            return True
+
+        tasks_with_grads = list(task_grads.keys())
+        lines = [f"\n[grad_cosine @ {self.num_timesteps:,} steps]"]
+        for i, t1 in enumerate(tasks_with_grads):
+            for j, t2 in enumerate(tasks_with_grads):
+                if j <= i:
+                    continue
+                g1, g2 = task_grads[t1], task_grads[t2]
+                cos = torch.nn.functional.cosine_similarity(
+                    g1.unsqueeze(0), g2.unsqueeze(0)
+                ).item()
+                lines.append(f"  {t1:>12} × {t2:<12}: {cos:+.3f}")
+        print("\n".join(lines), flush=True)
+        return True
+
+    def _on_step(self) -> bool:
+        return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-task eval — completed-episode stats + live gate counts per task
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _eval_per_task(env, raw_env: "MorphRotatingVecEnv", model, n_steps: int):
-    """Roll out for `n_steps`; group rewards/gates by `slot_tasks`."""
+    """Roll out for `n_steps`; group rewards/gates/residual norms by `slot_tasks`."""
     obs = env.reset()
     cur_r = np.zeros(env.num_envs, dtype=np.float64)
     cur_g = np.zeros(env.num_envs, dtype=np.int64)
@@ -392,6 +545,8 @@ def _eval_per_task(env, raw_env: "MorphRotatingVecEnv", model, n_steps: int):
     ep_g = {t: [] for t in TASK_NAMES}
     total_g = {t: 0 for t in TASK_NAMES}
     n_steps_per_task = {t: 0 for t in TASK_NAMES}
+    abs_res_sum = {t: 0.0 for t in TASK_NAMES}
+    abs_res_cnt = {t: 0 for t in TASK_NAMES}
 
     slot_tasks = raw_env.slot_tasks
     for _ in range(n_steps):
@@ -413,6 +568,10 @@ def _eval_per_task(env, raw_env: "MorphRotatingVecEnv", model, n_steps: int):
             if delta > 0:
                 total_g[t] += delta
             prev_g[i] = cur_g[i]
+            mar = info.get("mean_abs_residual", None)
+            if mar is not None:
+                abs_res_sum[t] += mar
+                abs_res_cnt[t] += 1
         for i, done in enumerate(dones):
             if done:
                 t = slot_tasks[i]
@@ -421,19 +580,24 @@ def _eval_per_task(env, raw_env: "MorphRotatingVecEnv", model, n_steps: int):
                 cur_r[i] = 0.0
                 cur_g[i] = 0
                 prev_g[i] = 0
-    return ep_r, ep_g, total_g, n_steps_per_task
+    mean_abs_res = {
+        t: abs_res_sum[t] / max(abs_res_cnt[t], 1) for t in TASK_NAMES
+    }
+    return ep_r, ep_g, total_g, n_steps_per_task, mean_abs_res
 
 
-def _format_eval(ep_r, ep_g, total_g, n_steps_per_task, dt: float = 0.01):
+def _format_eval(ep_r, ep_g, total_g, n_steps_per_task, mean_abs_res,
+                 dt: float = 0.01):
     lines = []
     for t in TASK_NAMES:
         r = float(np.mean(ep_r[t])) if ep_r[t] else float("nan")
         g = float(np.mean(ep_g[t])) if ep_g[t] else float("nan")
         n = len(ep_r[t])
         gps = total_g[t] / max(n_steps_per_task[t] * dt, 1e-9)
+        res = mean_abs_res.get(t, float("nan"))
         lines.append(
             f"  {t:>12}: reward/ep={r:+8.3f}  gates/ep={g:6.2f}  (n={n:>2})  "
-            f"gates/sec={gps:6.3f}  (live total={int(total_g[t])})"
+            f"gates/sec={gps:6.3f}  |res|={res:.3f}  (live total={int(total_g[t])})"
         )
     return "\n".join(lines)
 
@@ -446,7 +610,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--library", default="__data__/hex_library/v1/library.npz")
     p.add_argument("--num-envs", type=int, default=20)
-    p.add_argument("--steps", type=int, default=1_000_000)
+    p.add_argument("--steps", type=int, default=20_000_000)
     p.add_argument("--n-steps", type=int, default=1024)
     p.add_argument("--alpha", type=float, default=None,
                    help="Override per-task default residual scale. By default "
@@ -460,18 +624,45 @@ def main():
                         "annealing for a converging policy.")
     p.add_argument("--device", default="cpu")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--held-out", type=int, default=10,
+                   help="Morphs reserved for eval only (stratified across "
+                        "the 27 sampler cells). 0 disables the split.")
+    p.add_argument("--held-out-seed", type=int, default=0,
+                   help="RNG seed for the held-out selection; keep fixed "
+                        "across runs so the eval set is stable.")
     p.add_argument("--out-dir",
                    default=f"__data__/library_residual_mtrl/{time.strftime('%Y%m%d_%H%M%S')}")
+    p.add_argument("--resume", default=None,
+                   help="Path to a previous out_dir; auto-loads the latest "
+                        "checkpoint + vecnormalize.pkl and continues training. "
+                        "Step count carries over (reset_num_timesteps=False).")
     args = p.parse_args()
 
     np.random.seed(args.seed); torch.manual_seed(args.seed)
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    morphs = _load_morph_library(Path(args.library), n_morphs=args.num_envs)
-    print(f"loaded {len(morphs)} morphs from {args.library}")
+    all_morphs = _load_morph_library(Path(args.library), n_morphs=10**9)
+    print(f"loaded {len(all_morphs)} morphs from {args.library}")
 
-    # Assign tasks round-robin: every NUM_TASKS-th slot is the same task.
-    # With num_envs=20 → 4 slots per task × 5 tasks.
+    # Held-out split: reserved morphs never appear in a training worker.
+    # Persisted next to the checkpoint so Stage-4 eval uses the same set.
+    held_idx = _select_held_out(all_morphs, args.held_out, args.held_out_seed)
+    train_morphs = [m for i, m in enumerate(all_morphs) if i not in set(held_idx)]
+    split = {
+        "held_out_seed": args.held_out_seed,
+        "held_out_indices": held_idx,
+        "held_out_morph_seeds": [all_morphs[i]["morph_seed"] for i in held_idx],
+        "train_morph_seeds": [m["morph_seed"] for m in train_morphs],
+        "library": str(args.library),
+    }
+    (out_dir / "held_out.json").write_text(json.dumps(split, indent=2))
+    print(f"held out {len(held_idx)} morphs "
+          f"(seeds {split['held_out_morph_seeds']}); "
+          f"training on {len(train_morphs)}")
+
+    # One (morph, task) pair per worker: morphs cycle through the train
+    # split, tasks round-robin so every task gets num_envs/5 workers.
+    morphs = [train_morphs[i % len(train_morphs)] for i in range(args.num_envs)]
     tasks = [TASK_NAMES[i % NUM_TASKS] for i in range(len(morphs))]
     print("task distribution: "
           + ", ".join(f"{t}={tasks.count(t)}" for t in TASK_NAMES))
@@ -487,8 +678,8 @@ def main():
     # ── Stage 3 gate: step-0 per-task reward shows the prior is already
     # holding (hover task strongest; trajectory tasks should pass gates).
     print(f"\n[before training] random-residual rollout (1500 steps):")
-    ep_r, ep_g, total_g, nspt = _eval_per_task(env, raw_env, model=None, n_steps=1500)
-    print(_format_eval(ep_r, ep_g, total_g, nspt))
+    ep_r, ep_g, total_g, nspt, mar = _eval_per_task(env, raw_env, model=None, n_steps=1500)
+    print(_format_eval(ep_r, ep_g, total_g, nspt, mar))
 
     # ── PPO ----------------------------------------------------------------
     batch_size = (args.n_steps * args.num_envs) // 8
@@ -509,6 +700,34 @@ def main():
         verbose=1,
     )
 
+    # ── Resume from checkpoint --------------------------------------------
+    _reset_num_timesteps = True
+    if args.resume:
+        resume_dir = Path(args.resume)
+        ckpts = sorted((resume_dir / "checkpoints").glob("ppo_*_steps.zip"))
+        if ckpts:
+            latest_ckpt = ckpts[-1]
+            # Load weights + optimizer state into our fresh model so the
+            # architecture (policy_kwargs, n_steps, etc.) stays correct.
+            saved = PPO.load(str(latest_ckpt), device=args.device)
+            model.policy.load_state_dict(saved.policy.state_dict())
+            model.policy.optimizer.load_state_dict(
+                saved.policy.optimizer.state_dict()
+            )
+            model.num_timesteps = saved.num_timesteps
+            del saved
+            # Restore VecNormalize running stats
+            vn_path = resume_dir / "vecnormalize.pkl"
+            if vn_path.exists():
+                saved_vn = VecNormalize.load(str(vn_path), raw_env)
+                env.obs_rms = saved_vn.obs_rms
+                env.ret_rms = saved_vn.ret_rms
+                print(f"loaded VecNormalize stats from {vn_path.name}")
+            print(f"resumed from {latest_ckpt.name} ({model.num_timesteps:,} steps)")
+            _reset_num_timesteps = False
+        else:
+            print(f"no checkpoints in {resume_dir}/checkpoints — starting fresh")
+
     t0 = time.time()
     # Checkpoint every ~250k steps. Transient CUDA errors have killed runs
     # before; checkpoints make those recoverable without losing progress.
@@ -519,16 +738,18 @@ def main():
             save_freq=ckpt_freq, save_path=str(out_dir / "checkpoints"),
             name_prefix="ppo", save_vecnormalize=True,
         ),
+        GradientCosineCallback(raw_env, log_every=250_000),
     ]
-    model.learn(total_timesteps=args.steps, callback=callbacks, progress_bar=False)
+    model.learn(total_timesteps=args.steps, callback=callbacks, progress_bar=False,
+                reset_num_timesteps=_reset_num_timesteps)
     elapsed = time.time() - t0
     print(f"\ntrained {args.steps:,} steps in {elapsed:.1f}s "
           f"({args.steps/elapsed:.0f} sps)")
 
     # Final eval
     print(f"\n[after training] trained-policy rollout (1500 steps):")
-    ep_r, ep_g, total_g, nspt = _eval_per_task(env, raw_env, model=model, n_steps=1500)
-    print(_format_eval(ep_r, ep_g, total_g, nspt))
+    ep_r, ep_g, total_g, nspt, mar = _eval_per_task(env, raw_env, model=model, n_steps=1500)
+    print(_format_eval(ep_r, ep_g, total_g, nspt, mar))
 
     model.save(str(out_dir / "policy.zip"))
     env.save(str(out_dir / "vecnormalize.pkl"))
