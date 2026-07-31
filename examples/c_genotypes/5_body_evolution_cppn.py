@@ -178,7 +178,7 @@ class CPPNEvolution:
         parents = [ind for ind in population if ind.tags.get("ps", False)]
         if not parents:
             parents = population
-        new_offspring: List[Individual] = []
+        new_offspring: list[Individual] = []
         target_pool = self.config.target_population_size * 2
         while len(population) + len(new_offspring) < target_pool:
             if len(parents) >= 2 and RNG.random() < 0.5:
@@ -227,6 +227,7 @@ class CPPNEvolution:
             population,
             operations=ops,
             num_steps=BUDGET,
+            is_maximisation=self.config.is_maximisation,
             db_file_path=self.config.db_file_path,
             db_handling=self.config.db_handling,
         )
