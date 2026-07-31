@@ -137,9 +137,11 @@ def video_renderer(
     mujoco.mj_resetData(model, data)
 
     # Calculate steps per frame to avoid single iterations (see 'Notes'.)
-    options = mujoco.MjOption()
+    # Must read the *model's* timestep. `mujoco.MjOption()` is a fresh
+    # default-constructed option struct, so frame pacing was silently wrong
+    # for any model that did not use the 0.002 s default.
     steps_per_frame = duration / (
-        options.timestep * duration * video_recorder.fps
+        model.opt.timestep * duration * video_recorder.fps
     )
 
     # Update rendering engine
@@ -264,9 +266,11 @@ def tracking_video_renderer(
         log.warning("No 'core' body found — using default free camera.")
 
     # Calculate steps per frame to avoid single iterations
-    options = mujoco.MjOption()
+    # Must read the *model's* timestep. `mujoco.MjOption()` is a fresh
+    # default-constructed option struct, so frame pacing was silently wrong
+    # for any model that did not use the 0.002 s default.
     steps_per_frame = duration / (
-        options.timestep * duration * video_recorder.fps
+        model.opt.timestep * duration * video_recorder.fps
     )
 
     # Build the tracking camera once (reused every frame)

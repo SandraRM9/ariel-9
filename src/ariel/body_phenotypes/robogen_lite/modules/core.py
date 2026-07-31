@@ -12,18 +12,14 @@ from ariel.body_phenotypes.robogen_lite.config import (
     ModuleType,
 )
 from ariel.body_phenotypes.robogen_lite.modules.module import Module
+from ariel.parameters.ariel_modules import ArielModulesConfig
+
+# Global functions
+ariel_modules_config = ArielModulesConfig()
 
 # Type Aliases
 type WeightType = float
 type DimensionType = tuple[float, float, float]
-
-# --- Robogen Configuration --- #
-# Module weights (kg)
-CORE_MASS: WeightType = 1
-
-# Module dimensions (length, width, height) in meters
-CORE_DIMENSIONS: DimensionType = (0.10, 0.10, 0.10)
-# ------------------------------ #
 
 
 class CoreModule(Module):
@@ -54,8 +50,19 @@ class CoreModule(Module):
         # Set the index
         self.index = IDX_OF_CORE
 
+        # Configuration
+        core_half = ariel_modules_config.CORE_HALF
+        side_site_z = ariel_modules_config.CORE_SIDE_SITE_Z
+
         # Create the parent spec.
         spec = mujoco.MjSpec()
+
+        # Angles in this spec are radians, matching MujocoConfig.degree.
+        # MuJoCo's own default is degrees, and each element keeps the compiler
+        # settings of the spec it was authored in even after being attached
+        # into a world -- so leaving this at the default silently reinterpreted
+        # every angle-valued field (e.g. joint range) as degrees.
+        spec.compiler.degree = False
 
         # ========= Core =========
         core_name = self.module_type.name.lower()
@@ -65,16 +72,19 @@ class CoreModule(Module):
         core.add_geom(
             name=core_name,
             type=mujoco.mjtGeom.mjGEOM_BOX,
-            mass=CORE_MASS,
-            size=CORE_DIMENSIONS,
-            pos=[0, CORE_DIMENSIONS[0], 0],
+            mass=ariel_modules_config.CORE_MASS_SI,
+            size=core_half,
+            # Body origin sits on the back face, so the geom centre is half a
+            # length forward along y. (This read CORE_DIMENSIONS[0] before,
+            # which only happened to be correct because the core is a cube.)
+            pos=[0, core_half[1], 0],
             rgba=(253 / 255, 202 / 255, 64 / 255, 1),
         )
 
         core.add_camera(
             name=f"{core_name}_mycamera",
-            pos=[0, 0, CORE_DIMENSIONS[0]-0.02],
-            euler=[-90, 0, 180],
+            pos=[0, 0, core_half[2] - 0.02],
+            euler=np.deg2rad([-90, 0, 180]),
         )
 
         # ========= Attachment Points =========
@@ -82,7 +92,7 @@ class CoreModule(Module):
         shift = -1  # mujoco uses xyzw instead of wxyz
         self.sites[ModuleFaces.FRONT] = core.add_site(
             name=f"{core_name}-front",
-            pos=[0, CORE_DIMENSIONS[1] * 2, -CORE_DIMENSIONS[1] / 2],
+            pos=[0, core_half[1] * 2, side_site_z],
             quat=np.round(
                 np.roll(
                     qnp.as_float_array(
@@ -99,7 +109,7 @@ class CoreModule(Module):
         )
         self.sites[ModuleFaces.BACK] = core.add_site(
             name=f"{core_name}-back",
-            pos=[0, 0, -CORE_DIMENSIONS[1] / 2],
+            pos=[0, 0, side_site_z],
             quat=np.round(
                 np.roll(
                     qnp.as_float_array(
@@ -117,9 +127,9 @@ class CoreModule(Module):
         self.sites[ModuleFaces.LEFT] = core.add_site(
             name=f"{core_name}-left",
             pos=[
-                -CORE_DIMENSIONS[0],
-                CORE_DIMENSIONS[1],
-                -CORE_DIMENSIONS[1] / 2,
+                -core_half[0],
+                core_half[1],
+                side_site_z,
             ],
             quat=np.round(
                 np.roll(
@@ -138,9 +148,9 @@ class CoreModule(Module):
         self.sites[ModuleFaces.RIGHT] = core.add_site(
             name=f"{core_name}-right",
             pos=[
-                CORE_DIMENSIONS[0],
-                CORE_DIMENSIONS[1],
-                -CORE_DIMENSIONS[1] / 2,
+                core_half[0],
+                core_half[1],
+                side_site_z,
             ],
             quat=np.round(
                 np.roll(
@@ -158,7 +168,7 @@ class CoreModule(Module):
         )
         self.sites[ModuleFaces.TOP] = core.add_site(
             name=f"{core_name}-top",
-            pos=[0, CORE_DIMENSIONS[1], CORE_DIMENSIONS[2]],
+            pos=[0, core_half[1], core_half[2]],
             quat=np.round(
                 np.roll(
                     qnp.as_float_array(
@@ -175,7 +185,7 @@ class CoreModule(Module):
         )
         self.sites[ModuleFaces.BOTTOM] = core.add_site(
             name=f"{core_name}-bottom",
-            pos=[0, CORE_DIMENSIONS[1], -CORE_DIMENSIONS[2]],
+            pos=[0, core_half[1], -core_half[2]],
             quat=np.round(
                 np.roll(
                     qnp.as_float_array(

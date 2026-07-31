@@ -9,10 +9,9 @@ authors = [{ name = "jmdm", email = "jmdm.880@gmail.com" }]
 classifiers = ["Development Status :: 2 - Pre-Alpha"]
 
 dependencies = [
+  "astropy>=7.0.0",
   "attrs>=25.4.0",
   "deap>=1.4.3",
-  "dm-control>=1.0.38",
-  "evotorch>=0.6.1",
   "gymnasium>=1.2.3",
   "ipykernel>=6.30.1",
   "jupyter>=1.1.1",
@@ -44,6 +43,19 @@ dependencies = [
   "torchvision>=0.23.0",
 ]
 
+
+[project.optional-dependencies]
+# evotorch is used by exactly one example (examples/re_book/1_brain_evolution.py)
+# and by nothing under src/. It depends on ray, which publishes no Windows
+# wheel, so keeping it as a hard dependency makes `uv sync` fail outright on
+# win_amd64. Install with `pip install ariel[evotorch]` if you need that example.
+evotorch = ["evotorch>=0.6.1"]
+
+# dm-control is not imported anywhere under src/; the only mention in the repo
+# is a documentation URL in a comment. It pulls in labmaze, which has no wheel
+# for recent Python versions and falls back to a bazel source build that fails
+# on Windows. Kept available as an extra rather than removed outright.
+dm-control = ["dm-control>=1.0.38"]
 
 [project.urls]
 Homepage = "https://github.com/ci-group/ariel"

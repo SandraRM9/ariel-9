@@ -60,8 +60,9 @@ class BaseWorld:
         """
 
         # Use default mujoco config if none is provided
-        if mujoco_config is None:
-            self.mujoco_config = MujocoConfig()
+        self.mujoco_config = (
+            MujocoConfig() if mujoco_config is None else mujoco_config
+        )
 
         # Set world name
         if name is not None:
@@ -73,6 +74,9 @@ class BaseWorld:
             self.is_precompiled = self.load_from_xml()
             if self.is_precompiled:
                 log.debug("Precompiled XML loaded successfully.")
+                # A cached XML predates the current config, so the solver and
+                # compiler settings must be re-applied on top of it.
+                self._apply_compiler_and_options(self.spec)
                 return
 
         # Build and save specification
@@ -93,13 +97,8 @@ class BaseWorld:
         # Copy during attach
         spec.copy_during_attach = True
 
-        # --- Option --- #
-        spec.option.integrator = self.mujoco_config.integrator
-
-        # --- Compiler --- #
-        spec.compiler.autolimits = self.mujoco_config.autolimits
-        spec.compiler.balanceinertia = self.mujoco_config.balanceinertia
-        spec.compiler.degree = self.mujoco_config.degree
+        # --- Compiler + Option --- #
+        self._apply_compiler_and_options(spec)
 
         # --- Visual --- #
         spec.visual.global_.offheight = self.mujoco_config.offheight
@@ -170,6 +169,139 @@ class BaseWorld:
             fovy=45,
         )
         return spec
+
+    def _apply_compiler_and_options(self, spec: mj.MjSpec) -> None:
+        """Write every :class:`MujocoConfig` compiler/solver field onto a spec.
+
+        Kept separate from :meth:`_init_spec` so that it can also be applied to
+        a spec restored from a precompiled XML.
+
+        Parameters
+        ----------
+        spec : mj.MjSpec
+            The specification to configure, modified in place.
+        """
+        cfg = self.mujoco_config
+
+        # --- Option --- #
+        spec.option.timestep = cfg.timestep_si
+        spec.option.integrator = cfg.integrator
+        spec.option.solver = cfg.solver
+        spec.option.iterations = cfg.iterations
+        spec.option.ls_iterations = cfg.ls_iterations
+        spec.option.impratio = cfg.impratio
+        spec.option.cone = cfg.cone
+
+        # --- Compiler --- #
+        spec.compiler.autolimits = cfg.autolimits
+        spec.compiler.balanceinertia = cfg.balanceinertia
+        spec.compiler.degree = cfg.degree
+
+        # A contact time constant below 2 * timestep makes the constraint
+        # solver unstable, which shows up as limbs vibrating or being flung.
+        # These two settings live in different config fields, so it is easy to
+        # change one and silently invalidate the other. Both are astropy
+        # quantities, so the comparison is unit-safe even if one is written in
+        # milliseconds and the other in seconds.
+        min_timeconst = 2.0 * cfg.timestep
+        if cfg.geom_solref_timeconst < min_timeconst:
+            msg = (
+                f"geom_solref_timeconst={cfg.geom_solref_timeconst} is below "
+                f"2 * timestep ({min_timeconst}). Contacts will be unstable. "
+                f"Either raise geom_solref_timeconst or lower the timestep."
+            )
+            log.warning(msg)
+
+    def apply_contact_defaults(self, spawn_name: str | None = None) -> None:
+        """Apply the configured contact parameters to geoms in the world.
+
+        MuJoCo defaults are resolved per-spec at compile time, so defaults set
+        on the world do *not* reach the geoms of an attached robot spec. This
+        walks the merged spec instead.
+
+        Parameters
+        ----------
+        spawn_name : str | None, optional
+            If given, only geoms whose name starts with this prefix are treated
+            as robot geoms for the purpose of self-collision filtering. All
+            geoms receive the friction/solver defaults regardless.
+        """
+        cfg = self.mujoco_config
+
+        for geom in self.spec.geoms:
+            geom.solref = np.array(cfg.geom_solref)
+            geom.solimp = np.array(cfg.geom_solimp)
+            geom.friction = np.array(cfg.geom_friction)
+            geom.condim = cfg.geom_condim
+
+            # Robot geoms go on their own collision bit so that robot-robot and
+            # robot-self contacts can be disabled without also disabling
+            # contact with the terrain.
+            #   bit 1 -> world / terrain, bit 2 -> robot
+            if spawn_name is not None and geom.name.startswith(spawn_name):
+                geom.contype = 2
+                geom.conaffinity = 3 if cfg.enable_self_collision else 1
+
+    def convert_boxes_to_meshes(self) -> int:
+        """Replace every box geom with an equivalent 8-vertex convex mesh.
+
+        Works around a defect in MuJoCo's analytic box<->box collider
+        (``mjc_BoxBox``): for two boxes that share a parallel axis and overlap
+        by less than ~0.05 mm it collapses the two-point contact manifold to a
+        single point and reports a penetration depth orders of magnitude too
+        deep. On an ARIEL body a true overlap of 0.018 mm was reported as
+        76.458 mm; the solver ejected it with 5203 N*m of generalised force,
+        injecting 39 J in one 2 ms step and launching the robot.
+
+        Only the box<->box dispatch is affected, so making either geom a mesh
+        is enough; this converts all of them. The mesh is the exact convex hull
+        of the box, so collision geometry is unchanged and mass is preserved
+        bit-for-bit. Body inertia moves by ~0.2% because MuJoCo integrates it
+        over the mesh rather than using the closed-form box expression.
+
+        Reproduced on MuJoCo 3.2.7 through 3.8.0 -- it is long-standing, not a
+        regression, and neither ``margin`` nor the CCD flags avoid it.
+
+        Returns
+        -------
+        int
+            Number of geoms converted.
+        """
+        # One mesh asset per distinct box size, keyed by half-extents.
+        meshes: dict[tuple[float, ...], str] = {}
+        converted = 0
+
+        for geom in self.spec.geoms:
+            if geom.type != mj.mjtGeom.mjGEOM_BOX:
+                continue
+
+            half = tuple(round(float(v), 9) for v in geom.size[:3])
+            name = meshes.get(half)
+            if name is None:
+                name = f"boxmesh_{len(meshes)}"
+                vertices = [
+                    s * half[axis]
+                    for sx in (-1.0, 1.0)
+                    for sy in (-1.0, 1.0)
+                    for sz in (-1.0, 1.0)
+                    for axis, s in enumerate((sx, sy, sz))
+                ]
+                mesh = self.spec.add_mesh()
+                mesh.name = name
+                mesh.uservert = vertices
+                meshes[half] = name
+
+            geom.type = mj.mjtGeom.mjGEOM_MESH
+            geom.meshname = name
+            converted += 1
+
+        if converted:
+            msg = (
+                f"Converted {converted} box geoms to {len(meshes)} convex "
+                f"meshes to avoid the MuJoCo box-box collider defect."
+            )
+            log.debug(msg)
+        return converted
 
     def _find_lowest_position(
         self,
@@ -315,8 +447,13 @@ class BaseWorld:
         msg = f"Lowest robot position: {lowest_position} m"
         log.debug(msg)
 
-        # Adjust the spawn position to ensure the robot is above ground
-        diff_from_base = (base_point + spawn_site.pos[2]) - lowest_position
+        # Adjust the spawn position to ensure the robot is above ground.
+        # `lowest_position` is already a world-frame height, and `spawn_body`
+        # is expressed relative to `spawn_site`, so the site height must NOT be
+        # added again — doing so left the robot hovering at
+        # `base_point + spawn_site.pos[2]` above the floor and free-falling
+        # onto it at the start of every evaluation.
+        diff_from_base = base_point - lowest_position
         spawn_body.pos[2] += diff_from_base
         msg = f"Adjusted spawn position: {spawn_body.pos}"
         log.debug(msg)
@@ -417,6 +554,17 @@ class BaseWorld:
             body=robot_spec.worldbody,
             prefix=spawn_name,
         )
+
+        # Apply contact/friction defaults and self-collision filtering to the
+        # merged spec. Must happen before the spawn correction, which compiles
+        # the spec to look for contacts.
+        self.apply_contact_defaults(spawn_name=spawn_name)
+
+        # Route box<->box pairs away from MuJoCo's faulty analytic collider.
+        # Must also happen before the spawn correction, which compiles the spec
+        # and reads contact distances back out of it.
+        if self.mujoco_config.convert_boxes_to_meshes:
+            self.convert_boxes_to_meshes()
 
         # Correct the spawn position if requested
         if correct_collision_with_floor is True:

@@ -27,6 +27,12 @@ class Controller:
     # How big a step to take towards the output fot the callback function
     alpha: float = 0.5
 
+    # Maximum commanded angular change per second, in rad/s. A real servo
+    # cannot teleport its setpoint, but a position actuator will happily chase
+    # a step change with whatever torque it takes. `None` disables the limit.
+    # Default is the SER0019 no-load speed (60 deg / 0.18 s).
+    max_ctrl_rate: float | None = np.deg2rad(60.0) / 0.18
+
     # Optional tracker to save data during simulation
     tracker: Tracker = field(default_factory=Tracker)
 
@@ -80,8 +86,27 @@ class Controller:
             # Calculate the new control values
             new_ctrl = (old_ctrl * (1 - self.alpha)) + (output * self.alpha)
 
-            # Ensure that the new control values are within the servo bounds
-            data.ctrl = np.clip(new_ctrl, -np.pi / 2, np.pi / 2)
+            # Respect the servo's slew rate over the control interval, so a
+            # step change in the setpoint cannot demand an impulsive torque.
+            if self.max_ctrl_rate is not None:
+                max_delta = self.max_ctrl_rate * (
+                    self.time_steps_per_ctrl_step * time_step
+                )
+                new_ctrl = old_ctrl + np.clip(
+                    new_ctrl - old_ctrl,
+                    -max_delta,
+                    max_delta,
+                )
+
+            # Ensure that the new control values are within the servo bounds.
+            # Read the bounds off the model rather than hard-coding +-pi/2, so
+            # that a change to the actuator config cannot silently desync.
+            if model.nu and model.actuator_ctrllimited.all():
+                lo = model.actuator_ctrlrange[:, 0]
+                hi = model.actuator_ctrlrange[:, 1]
+            else:
+                lo, hi = -np.pi / 2, np.pi / 2
+            data.ctrl = np.clip(new_ctrl, lo, hi)
 
             # Check if there are any NaN values in the control signal
             if np.any(np.isnan(data.ctrl)):

@@ -36,8 +36,18 @@ class BrickModule(Module):
         # Set the index of the module
         self.index = index
 
+        # Configuration
+        brick_half = ariel_modules_config.BRICK_HALF
+
         # Create the parent spec.
         spec = mujoco.MjSpec()
+
+        # Angles in this spec are radians, matching MujocoConfig.degree.
+        # MuJoCo's own default is degrees, and each element keeps the compiler
+        # settings of the spec it was authored in even after being attached
+        # into a world -- so leaving this at the default silently reinterpreted
+        # every angle-valued field (e.g. joint range) as degrees.
+        spec.compiler.degree = False
 
         # ========= BRICK =========
         brick_name = self.module_type.name.lower()
@@ -47,9 +57,12 @@ class BrickModule(Module):
         brick.add_geom(
             name=brick_name,
             type=mujoco.mjtGeom.mjGEOM_BOX,
-            mass=ariel_modules_config.BRICK_MASS,
-            size=ariel_modules_config.BRICK_DIMENSIONS,
-            pos=[0, ariel_modules_config.BRICK_DIMENSIONS[0], 0],
+            mass=ariel_modules_config.BRICK_MASS_SI,
+            size=brick_half,
+            # Body origin sits on the back face, so the geom centre is half a
+            # length forward along y. (This read brick_half[0] before, which
+            # only happened to be correct because the brick is a cube.)
+            pos=[0, brick_half[1], 0],
             rgba=(28 / 255, 119 / 255, 195 / 255, 1),
         )
 
@@ -58,7 +71,7 @@ class BrickModule(Module):
         shift = -1  # mujoco uses xyzw instead of wxyz
         self.sites[ModuleFaces.FRONT] = brick.add_site(
             name=f"{brick_name}-front",
-            pos=[0, ariel_modules_config.BRICK_DIMENSIONS[1] * 2, 0],
+            pos=[0, brick_half[1] * 2, 0],
             quat=np.round(
                 np.roll(
                     qnp.as_float_array(
@@ -76,8 +89,8 @@ class BrickModule(Module):
         self.sites[ModuleFaces.LEFT] = brick.add_site(
             name=f"{brick_name}-left",
             pos=[
-                -ariel_modules_config.BRICK_DIMENSIONS[0],
-                ariel_modules_config.BRICK_DIMENSIONS[1],
+                -brick_half[0],
+                brick_half[1],
                 0,
             ],
             quat=np.round(
@@ -97,8 +110,8 @@ class BrickModule(Module):
         self.sites[ModuleFaces.RIGHT] = brick.add_site(
             name=f"{brick_name}-right",
             pos=[
-                ariel_modules_config.BRICK_DIMENSIONS[0],
-                ariel_modules_config.BRICK_DIMENSIONS[1],
+                brick_half[0],
+                brick_half[1],
                 0,
             ],
             quat=np.round(
@@ -119,8 +132,8 @@ class BrickModule(Module):
             name=f"{brick_name}-top",
             pos=[
                 0,
-                ariel_modules_config.BRICK_DIMENSIONS[1],
-                ariel_modules_config.BRICK_DIMENSIONS[2],
+                brick_half[1],
+                brick_half[2],
             ],
             quat=np.round(
                 np.roll(
@@ -140,8 +153,8 @@ class BrickModule(Module):
             name=f"{brick_name}-bottom",
             pos=[
                 0,
-                ariel_modules_config.BRICK_DIMENSIONS[1],
-                -ariel_modules_config.BRICK_DIMENSIONS[2],
+                brick_half[1],
+                -brick_half[2],
             ],
             quat=np.round(
                 np.roll(
