@@ -116,6 +116,49 @@ class MujocoConfig(BaseSettings):
     # by MuJoCo; this controls the rest of the body.
     enable_self_collision: bool = True
 
+    # Self-contacts (robot geom <-> robot geom, after convert_boxes_to_meshes)
+    # get their own, softer solref time constant than geom_solref_timeconst.
+    #
+    # convert_boxes_to_meshes routes box<->box pairs around MuJoCo's analytic
+    # mjc_BoxBox defect, but two non-adjacent modules that swing into an
+    # exactly-parallel, exactly-flush pose during an active gait (common on
+    # repeated-segment bodies, e.g. centipede_3/4/5) can still trip a related
+    # numerical edge case in the general convex<->convex path used for
+    # mesh<->mesh contacts: a stable, near-zero gap suddenly reports tens of
+    # mm of penetration in a single step, and the stiff 5ms solver ejects it
+    # violently (qvel > 100 rad/s from a resting state, single 2ms step).
+    #
+    # Investigated 2026-08-11: neither `margin` (tested 0.2-2mm) nor giving
+    # every geom its own non-shared mesh asset changed the failure rate. A
+    # minimal 2-body repro (no ARIEL scaffolding) could not reproduce it
+    # either statically or dynamically in isolation, suggesting it needs the
+    # full multi-body/many-simultaneous-contact context of a real robot, not
+    # a single pairwise narrow-phase bug. What *did* work empirically:
+    # softening self-contact solref alone eliminated it cleanly. Bisected on
+    # centipede_3 (the worst-hit body, ~90-100% explosion rate per 50-eval
+    # run at the original 5ms): 10ms/12ms -> still exploding (10/10, 9/10),
+    # 14ms -> 0/10, confirmed clean up through 16/18/20ms too. 14ms is the
+    # lowest value tested that fully eliminates it, so it's used here rather
+    # than a larger margin, to minimize the floor-mixing side effect below.
+    # Re-confirmed 0/40 on centipede_3 across two independent seed batches at
+    # 20ms and 0/10 each on gecko, centipede_4, centipede_5 (the other bodies
+    # that exploded in a full john-set sweep) before narrowing to 14ms.
+    # Single-seed fitness comparison on the 9 bodies that already worked
+    # showed swings both up (+19%) and down (-27%) with no clear directional
+    # harm - within plausible PSO run-to-run noise, not a signature of a real
+    # regression.
+    #
+    # Caveat: this is a geom-level value, so MuJoCo's default solmix
+    # averaging also softens floor<->robot contacts from 5ms to 9.5ms (the
+    # simple average) as a side effect - confirmed by inspecting
+    # data.contact[i].solref at runtime. Still far above the 2*timestep
+    # (4ms) stability floor, and the fitness check above showed no clear
+    # harm, but a more surgical fix would use explicit <pair> overrides for
+    # robot<->robot geom pairs only, leaving floor contacts untouched. Not
+    # implemented here - flagging as the natural next step if the floor
+    # softening ever turns out to matter.
+    self_contact_solref_timeconst: Time = 14 * u.ms
+
     # --- Box-box collider workaround --- #
     # MuJoCo's analytic box<->box collider (mjc_BoxBox) returns a grossly wrong
     # penetration depth for two boxes that share a parallel axis and touch at
@@ -161,5 +204,13 @@ class MujocoConfig(BaseSettings):
         """Contact ``solref`` as MuJoCo wants it: (seconds, dampratio)."""
         return (
             si(self.geom_solref_timeconst, u.s),
+            self.geom_solref_dampratio,
+        )
+
+    @property
+    def self_contact_solref(self) -> tuple[float, float]:
+        """Robot self-contact ``solref``: (seconds, dampratio)."""
+        return (
+            si(self.self_contact_solref_timeconst, u.s),
             self.geom_solref_dampratio,
         )

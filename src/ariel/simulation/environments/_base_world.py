@@ -242,6 +242,16 @@ class BaseWorld:
                 geom.contype = 2
                 geom.conaffinity = 3 if cfg.enable_self_collision else 1
 
+                # Self-contacts get a softer solref than geom_solref_timeconst.
+                # See MujocoConfig.self_contact_solref_timeconst for why: the
+                # stiff default can eject a robot on a single bad-depth
+                # reading from the mesh<->mesh collider, mostly on
+                # repeated-segment bodies (centipedes). Also softens
+                # floor<->robot contacts via MuJoCo's solref averaging (5ms
+                # mixes with 20ms to 12.5ms) - accepted tradeoff, see the
+                # config docstring.
+                geom.solref = np.array(cfg.self_contact_solref)
+
     def convert_boxes_to_meshes(self) -> int:
         """Replace every box geom with an equivalent 8-vertex convex mesh.
 

@@ -257,8 +257,6 @@ dependencies = [
     { name = "astropy" },
     { name = "attrs" },
     { name = "deap" },
-    { name = "dm-control" },
-    { name = "evotorch" },
     { name = "gymnasium" },
     { name = "ipykernel" },
     { name = "jupyter" },
@@ -288,6 +286,14 @@ dependencies = [
     { name = "sqlmodel" },
     { name = "torch" },
     { name = "torchvision" },
+]
+
+[package.optional-dependencies]
+dm-control = [
+    { name = "dm-control" },
+]
+evotorch = [
+    { name = "evotorch" },
 ]
 
 [package.dev-dependencies]
@@ -348,8 +354,8 @@ requires-dist = [
     { name = "astropy", specifier = ">=7.0.0" },
     { name = "attrs", specifier = ">=25.4.0" },
     { name = "deap", specifier = ">=1.4.3" },
-    { name = "dm-control", specifier = ">=1.0.38" },
-    { name = "evotorch", specifier = ">=0.6.1" },
+    { name = "dm-control", marker = "extra == 'dm-control'", specifier = ">=1.0.38" },
+    { name = "evotorch", marker = "extra == 'evotorch'", specifier = ">=0.6.1" },
     { name = "gymnasium", specifier = ">=1.2.3" },
     { name = "ipykernel", specifier = ">=6.30.1" },
     { name = "jupyter", specifier = ">=1.1.1" },
@@ -380,6 +386,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.8.0" },
     { name = "torchvision", specifier = ">=0.23.0" },
 ]
+provides-extras = ["evotorch", "dm-control"]
 
 [package.metadata.requires-dev]
 dev = [
