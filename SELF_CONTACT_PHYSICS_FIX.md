@@ -16,7 +16,7 @@ minimal 2-body repro couldn't reproduce it either — it needs the full
 multi-body contact context of a real robot.
 
 **Fix:** soften the *self*-contact `solref` time constant only (robot↔robot
-geom pairs, separate from floor contacts) —
+geom pairs, separate from floor contacts) -
 `MujocoConfig.self_contact_solref_timeconst` in `mujoco_params.py`, applied
 in `_base_world.py`.
 
@@ -32,20 +32,17 @@ in `_base_world.py`.
 **14 ms** used — lowest value that fully fixes it. Re-confirmed 0/40 on
 `centipede_3` (two seed batches) and 0/10 each on `gecko`, `centipede_4`,
 `centipede_5`. Regression check on the 9 bodies that already worked: fitness
-swung ±19-27% with no directional harm — normal CMA-ES run noise.
+swung ±19-27% with no directional harm: normal CMA-ES run noise.
 
 **Known tradeoff:** `solref` is geom-level, so MuJoCo's `solmix` averaging
 also softens floor↔robot contacts (5 ms → 9.5 ms). Still well above the
 4 ms stability floor and no measured harm, but a `<pair>`-based override
 would be more surgical if that ever matters — not implemented here.
 
-## Does it actually work now? — neuroevolution sweep
+## Results after the fix
 
 CMA-ES controller evolution across all 13 `john_set` bodies, 4 seeds each,
 300 generations, in `OlympicArena` (`__data__/claude_neuroevo_sweep.py`).
-Evolution actively searches for gaits — including ones that swing segments
-into flush self-contact — so this exercises the failure mode directly,
-rather than just sampling random controllers.
 
 **15,600 evals total, 0 explosions**, including on all 4 previously-exploding
 bodies. Fitness = forward displacement (m) over an 8 s rollout; "mean best"
@@ -69,10 +66,6 @@ is the mean of each seed's best individual, across 4 seeds:
 
 *(bold = previously exploding pre-fix)*
 
-It's not just "stable, going nowhere" either — mean fitness over the first
-10 generations sits at ~0.000 ± 0.003 m (i.e. random-init controllers barely
-move) across every body, vs ~0.07-0.18 m over the last 10 generations.
-Evolution is genuinely optimizing, not just failing to explode.
 
 ## Files changed
 
